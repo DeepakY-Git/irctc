@@ -56,6 +56,7 @@ class Config:
     poll_interval_seconds: int
     use_browser_rendering: bool
     browser_wait_seconds: int
+    cutoff_at: Optional[datetime] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,6 +76,7 @@ class AvailabilityEntry:
     train_name: str
     train_class: str
     raw_text: str
+    status: str = "UNKNOWN"
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,6 +124,11 @@ def parse_args() -> argparse.Namespace:
         default=int(os.getenv("BROWSER_WAIT_SECONDS", "5")),
         help="Extra time to wait after the page loads so client-side data can appear.",
     )
+    parser.add_argument(
+        "--cutoff",
+        default=os.getenv("MONITOR_CUTOFF", ""),
+        help="Stop monitoring at an ISO datetime, for example 2026-06-18T23:00:00.",
+    )
     return parser.parse_args()
 
 
@@ -135,6 +142,7 @@ def build_config(args: argparse.Namespace) -> Config:
     if not args.travel_date:
         raise ValueError("travel date is required")
     state_file = Path(args.state_file).expanduser().resolve()
+    cutoff_at = datetime.fromisoformat(args.cutoff) if args.cutoff else None
 
     return Config(
         train_number=args.train_number,
@@ -152,6 +160,7 @@ def build_config(args: argparse.Namespace) -> Config:
         poll_interval_seconds=args.poll_interval_seconds,
         use_browser_rendering=args.use_browser_rendering,
         browser_wait_seconds=args.browser_wait_seconds,
+        cutoff_at=cutoff_at,
     )
 
 
@@ -220,6 +229,20 @@ def parse_train_identity(text: str) -> tuple[str, str]:
     return train_number, train_name
 
 
+def normalize_availability_status(value: str) -> str:
+    normalized = normalize_text(value).upper().replace(" ", "_")
+    normalized = normalized.replace("CURR_AVL", "CURR_AVBL")
+    if normalized == "CURRENT_AVAILABLE" or normalized.startswith("CURRENT_AVAILABLE_"):
+        return "AVAILABLE"
+    if normalized.startswith(("WL", "RLWL", "GNWL", "TQWL", "PQWL")):
+        return "WL"
+    if normalized.startswith("CURR_AVBL"):
+        return "CURR_AVBL"
+    if normalized.startswith("AVAILABLE") or normalized == "AVL":
+        return "AVAILABLE"
+    return normalized
+
+
 def parse_availability_entries(soup: BeautifulSoup) -> list[AvailabilityEntry]:
     """Extract all class/status rows from a page.
 
@@ -233,7 +256,7 @@ def parse_availability_entries(soup: BeautifulSoup) -> list[AvailabilityEntry]:
 
     entries: list[AvailabilityEntry] = []
     availability_pattern = re.compile(
-        r"\b(?P<class>1A|2A|3A|SL|CC|EC|2S|FC|AC|GN|PQ|TQ|PT|RLWL|TQWL|GNWL)\b\s+₹?\d+(?:\.\d+)?\s+(?:CURR_AVL|CURR_AVBL|CURRENT AVAILABLE|(?<!NOT )AVAILABLE|AVL)\b",
+        r"\b(?P<class>1A|2A|3A|SL|CC|EC|2S|FC|AC)\b\s+₹?\d+(?:\.\d+)?\s+(?P<status>CURR_AVL|CURR_AVBL|CURRENT AVAILABLE|(?<!NOT )AVAILABLE|AVL|WL\w*)\b",
         re.I,
     )
 
@@ -254,6 +277,7 @@ def parse_availability_entries(soup: BeautifulSoup) -> list[AvailabilityEntry]:
                     train_number=train_number,
                     train_name=train_name,
                     train_class=match.group("class").upper(),
+                    status=normalize_availability_status(match.group("status")),
                     raw_text=text,
                 )
             )
@@ -280,9 +304,14 @@ def parse_confirmtkt_entries(soup: BeautifulSoup) -> list[AvailabilityEntry]:
             continue
 
         for availability_container in train_card.select("div[class*='_avail-card']"):
-            status_node = availability_container.find(string=lambda value: isinstance(value, str) and "CURR_AVL" in value)
+            status_node = availability_container.find(
+                string=lambda value: isinstance(value, str)
+                and re.search(r"CURR_AVL|AVAILABLE|WL", value, re.I)
+            )
             if not status_node:
                 continue
+
+            status = normalize_availability_status(status_node)
 
             class_label = None
             for span in availability_container.find_all("span"):
@@ -299,6 +328,7 @@ def parse_confirmtkt_entries(soup: BeautifulSoup) -> list[AvailabilityEntry]:
                     train_number=train_number,
                     train_name=train_name,
                     train_class=class_label,
+                    status=status,
                     raw_text=normalize_text(availability_container.get_text(" ", strip=True)),
                 )
             )
@@ -307,10 +337,10 @@ def parse_confirmtkt_entries(soup: BeautifulSoup) -> list[AvailabilityEntry]:
 
 
 def dedupe_entries(entries: list[AvailabilityEntry]) -> list[AvailabilityEntry]:
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     unique_entries: list[AvailabilityEntry] = []
     for entry in entries:
-        marker = (entry.train_number, entry.train_name, entry.train_class)
+        marker = (entry.train_number, entry.train_name, entry.train_class, entry.status)
         if marker in seen:
             continue
         seen.add(marker)
@@ -318,7 +348,7 @@ def dedupe_entries(entries: list[AvailabilityEntry]) -> list[AvailabilityEntry]:
     return unique_entries
 
 
-def fetch_availability(session: requests.Session, config: Config) -> list[AvailabilityEntry]:
+def discover_trains(session: requests.Session, config: Config) -> list[AvailabilityEntry]:
     url = resolve_tracking_url(config)
     last_error: Optional[Exception] = None
 
@@ -336,6 +366,25 @@ def fetch_availability(session: requests.Session, config: Config) -> list[Availa
             raise RuntimeError("failed to fetch availability after retries") from last_error
 
     raise RuntimeError("failed to fetch availability")
+
+
+def filter_candidates(entries: list[AvailabilityEntry], config: Config) -> list[AvailabilityEntry]:
+    train_number = config.train_number.strip().upper()
+    travel_class = config.travel_class.strip().upper()
+    return [
+        entry
+        for entry in entries
+        if (train_number in {"", "NA", "ALL"} or entry.train_number == train_number)
+        and (not travel_class or entry.train_class == travel_class)
+    ]
+
+
+def is_cutoff_reached(config: Config, now: Optional[datetime] = None) -> bool:
+    return bool(config.cutoff_at and (now or datetime.now()) >= config.cutoff_at)
+
+
+def fetch_availability(session: requests.Session, config: Config) -> list[AvailabilityEntry]:
+    return filter_candidates(discover_trains(session, config), config)
 
 
 def load_html(session: requests.Session, config: Config, url: str) -> str:
@@ -383,6 +432,9 @@ def load_html_with_browser(url: str, config: Config) -> str:
 
 
 def state_signature(config: Config, entries: list[AvailabilityEntry]) -> str:
+    actionable_entries = [
+        entry for entry in entries if entry.status in {"AVAILABLE", "CURR_AVBL"}
+    ]
     payload = {
         "train_number": config.train_number,
         "source_station": config.source_station,
@@ -390,7 +442,7 @@ def state_signature(config: Config, entries: list[AvailabilityEntry]) -> str:
         "travel_date": config.travel_date,
         "travel_class": config.travel_class,
         "quota": config.quota,
-        "entries": [dataclasses.asdict(entry) for entry in entries],
+        "entries": [dataclasses.asdict(entry) for entry in actionable_entries],
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return digest
@@ -414,14 +466,14 @@ def clear_last_alert(state_file: Path) -> None:
 
 
 def alert_condition_met(entries: list[AvailabilityEntry]) -> bool:
-    return bool(entries)
+    return any(entry.status in {"AVAILABLE", "CURR_AVBL"} for entry in entries)
 
 
 def summarize_entries(entries: list[AvailabilityEntry]) -> str:
     parts = []
     for entry in entries:
         train_label = f"{entry.train_name} {entry.train_number}".strip()
-        parts.append(f"{train_label} - {entry.train_class}")
+        parts.append(f"{train_label} - {entry.train_class} ({entry.status})")
     return "; ".join(parts)
 
 
@@ -460,6 +512,9 @@ def run(config: Config) -> int:
     session = requests.Session()
 
     while True:
+        if is_cutoff_reached(config):
+            log_line("Cutoff reached; stopping monitor.")
+            return 0
         entries = fetch_availability(session, config)
         if alert_condition_met(entries):
             log_line(f"Parsed availability: {summarize_entries(entries)}")
@@ -471,7 +526,6 @@ def run(config: Config) -> int:
                 send_pushover_alert(session, config, entries)
                 write_last_alert(config.state_file, signature)
                 log_line("Alert sent and state updated.")
-                return 0
         else:
             log_line("No current availability rows found.")
             clear_last_alert(config.state_file)

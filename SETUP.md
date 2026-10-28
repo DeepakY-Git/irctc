@@ -27,7 +27,7 @@ Run the dashboard locally with Streamlit:
 streamlit run streamlit_app.py
 ```
 
-The UI auto-refreshes every 90 seconds while monitoring is enabled. When the parser finds one or more current-availability cards, it sends the configured Pushover alert and writes the local duplicate-suppression file.
+The UI auto-refreshes every 90 seconds while monitoring is enabled. It discovers candidate trains, filters by train number and class, and categorizes each row as waitlist (`WL`), standard availability (`AVAILABLE`), or current availability (`CURR_AVBL-N`). Only the latter two trigger the configured Pushover alert. Disable auto refresh to stop the UI monitor, or set an optional ISO cutoff when adding a query.
 
 ## Environment Variables
 
@@ -49,6 +49,7 @@ Set these values before starting the script:
 - `ALERT_STATE_FILE`: Optional override for the duplicate-suppression file, default `alert_fired.txt`.
 - `HTTP_TIMEOUT_SECONDS`: Optional HTTP timeout, default `20`.
 - `CHECK_INTERVAL_SECONDS`: Optional polling interval, default `90`.
+- `MONITOR_CUTOFF`: Optional ISO datetime at which the headless monitor stops, for example `2026-06-18T23:00:00`.
 
 Example shell exports:
 
@@ -69,7 +70,7 @@ If you want the ConfirmTkt home page flow, set `TRACKING_URL` to `https://www.co
 
 ## How the Scheduler Works
 
-The script polls the tracking page every 90 seconds by default and stops only when current availability is detected or you interrupt it. Because cron is minute-based, the most reliable way to keep the cadence is to let the script run as a long-lived process.
+The script polls the tracking page every 90 seconds by default and continues after an alert until the cutoff is reached or you interrupt it. Because cron is minute-based, the most reliable way to keep the cadence is to let the script run as a long-lived process.
 
 For ConfirmTkt and similar pages, keep `USE_BROWSER_RENDERING=1` so Chromium executes the client-side JavaScript before BeautifulSoup reads the DOM.
 
@@ -86,6 +87,8 @@ python irctc_agent_alert.py \
   --quota "$QUOTA" \
   --tracking-url "$TRACKING_URL"
 ```
+
+Add `--cutoff "2026-06-18T23:00:00"` to stop the worker at a fixed time. The worker continues polling after an alert and suppresses duplicate notifications for the same actionable availability state until it clears or changes.
 
 If you are testing ConfirmTkt specifically, point `TRACKING_URL` at the route page and leave browser rendering enabled.
 

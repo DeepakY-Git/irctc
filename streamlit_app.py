@@ -1,5 +1,6 @@
 import os
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -11,6 +12,7 @@ from irctc_agent_alert import (
     alert_condition_met,
     clear_last_alert,
     fetch_availability,
+    is_cutoff_reached,
     read_last_alert,
     resolve_tracking_url,
     send_pushover_alert,
@@ -22,6 +24,7 @@ from irctc_agent_alert import (
 
 DEFAULT_STATE_DIR = Path(".alert_state")
 DEFAULT_TRACKING_URL = "https://www.confirmtkt.com"
+DEFAULT_TRAVEL_DATE = (datetime.now() + timedelta(days=1)).strftime("%d-%m-%Y")
 
 
 st.set_page_config(page_title="IRCTC Current Availability", page_icon="🚆", layout="wide")
@@ -33,7 +36,7 @@ def init_state() -> None:
     st.session_state.setdefault("run_once_all", False)
     st.session_state.setdefault("add_source", "GWL")
     st.session_state.setdefault("add_destination", "NDLS")
-    st.session_state.setdefault("add_travel_date", "18-06-2026")
+    st.session_state.setdefault("add_travel_date", DEFAULT_TRAVEL_DATE)
     st.session_state.setdefault("add_travel_class", "SL")
     st.session_state.setdefault("add_quota", "GN")
     st.session_state.setdefault("add_tracking_url", DEFAULT_TRACKING_URL)
@@ -44,6 +47,7 @@ def init_state() -> None:
     st.session_state.setdefault("add_timeout_seconds", 20)
     st.session_state.setdefault("add_browser_wait_seconds", 7)
     st.session_state.setdefault("add_use_browser_rendering", True)
+    st.session_state.setdefault("add_cutoff", "")
 
 
 def normalize_tracking_url(value: str) -> str:
@@ -73,11 +77,13 @@ def create_query() -> dict:
         "timeout_seconds": int(st.session_state["add_timeout_seconds"]),
         "browser_wait_seconds": int(st.session_state["add_browser_wait_seconds"]),
         "use_browser_rendering": bool(st.session_state["add_use_browser_rendering"]),
+        "cutoff": st.session_state["add_cutoff"].strip(),
         "poll_interval_seconds": 90,
     }
 
 
 def build_query_config(query: dict) -> Config:
+    cutoff_value = query.get("cutoff", "").strip()
     return Config(
         train_number=query.get("train_number", "NA") or "NA",
         source_station=query["source_station"],
@@ -94,11 +100,17 @@ def build_query_config(query: dict) -> Config:
         poll_interval_seconds=int(query.get("poll_interval_seconds", 90)),
         use_browser_rendering=bool(query.get("use_browser_rendering", True)),
         browser_wait_seconds=int(query.get("browser_wait_seconds", 7)),
+        cutoff_at=datetime.fromisoformat(cutoff_value) if cutoff_value else None,
     )
 
 
 def add_query() -> None:
     query = create_query()
+    try:
+        build_query_config(query)
+    except ValueError as exc:
+        st.error(f"Invalid cutoff: {exc}")
+        return
     st.session_state["queries"].append(query)
     st.toast("Query added", icon="✅")
 
@@ -151,13 +163,18 @@ def render_query_card(query: dict, auto_run: bool) -> None:
                 remove_query(query["id"])
                 return
 
-        if auto_run:
+        if is_cutoff_reached(config):
+            st.caption("Cutoff reached; monitoring stopped for this query.")
+        elif auto_run:
             try:
                 entries, sent, summary = run_query_cycle(query)
                 if entries:
-                    st.success(f"{len(entries)} current availability options found")
+                    actionable = [entry for entry in entries if entry.status in {"AVAILABLE", "CURR_AVBL"}]
+                    st.success(f"{len(entries)} candidate options found")
                     for entry in entries:
-                        st.write(f"{entry.train_name} {entry.train_number} - {entry.train_class}")
+                        label = f"{entry.train_name} {entry.train_number} - {entry.train_class} ({entry.status})"
+                        st.write(f"🚨 {label}" if entry.status in {"AVAILABLE", "CURR_AVBL"} else label)
+                    st.caption(f"Parsed availability: {len(actionable)} actionable, {len(entries) - len(actionable)} waitlist/other")
                 else:
                     st.info("No current availability rows found.")
 
@@ -191,6 +208,12 @@ with st.sidebar:
     st.session_state["add_timeout_seconds"] = st.number_input("Timeout seconds", min_value=5, max_value=120, value=int(st.session_state["add_timeout_seconds"]), key="add_timeout_seconds_input")
     st.session_state["add_browser_wait_seconds"] = st.number_input("Browser wait seconds", min_value=1, max_value=30, value=int(st.session_state["add_browser_wait_seconds"]), key="add_browser_wait_seconds_input")
     st.session_state["add_use_browser_rendering"] = st.checkbox("Use browser rendering", value=bool(st.session_state["add_use_browser_rendering"]), key="add_use_browser_rendering_input")
+    st.session_state["add_cutoff"] = st.text_input(
+        "Cutoff (optional ISO datetime)",
+        value=st.session_state["add_cutoff"],
+        key="add_cutoff_input",
+        help="Example: 2026-06-18T23:00:00",
+    )
 
     if st.button("Add query"):
         add_query()
@@ -203,14 +226,16 @@ with st.sidebar:
 
 
 queries = st.session_state["queries"]
-auto_run = st.session_state["monitoring_enabled"] and bool(queries)
+active_queries = [query for query in queries if not is_cutoff_reached(build_query_config(query))]
+auto_run = st.session_state["monitoring_enabled"] and bool(active_queries)
 
 if auto_run:
     st_autorefresh(interval=90_000, key="irctc-refresh")
 
 if not queries:
-    st.info("Add a query in the sidebar to start monitoring. Removing a query stops only that query.")
+    st.info("Discover trains, filter candidates, and monitor availability by adding a query in the sidebar.")
 else:
+    st.caption("Discover trains → filter by train and class → parse availability → alert on AVAILABLE or CURR_AVBL")
     for query in list(queries):
         render_query_card(query, auto_run or st.session_state.get("run_once_all", False))
 
